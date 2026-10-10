@@ -1,0 +1,10 @@
+services:
+  mesh-bridge:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      MESHTASTIC_HOST: 10.0.0.153
+    volumes:
+      - ./data:/data
