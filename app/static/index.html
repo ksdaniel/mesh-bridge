@@ -34,6 +34,31 @@
     </form>
   </div>
 
+  <dialog id="route" class="rounded-lg shadow-xl p-0 w-[min(32rem,calc(100vw-2rem))] backdrop:bg-black/40">
+    <div class="p-4 space-y-4">
+      <div class="flex items-center justify-between">
+        <h2 class="font-semibold">Message route</h2>
+        <button id="route-close" class="text-slate-500 hover:text-slate-800 px-2" aria-label="Close">✕</button>
+      </div>
+      <p id="route-text" class="text-sm bg-emerald-50 rounded px-2 py-1 whitespace-pre-wrap break-words"></p>
+      <section>
+        <h3 class="text-sm font-semibold text-slate-600 mb-1">Delivery</h3>
+        <div id="route-ack" class="text-sm space-y-1"></div>
+      </section>
+      <section>
+        <h3 class="text-sm font-semibold text-slate-600 mb-1">Traceroute</h3>
+        <p class="text-xs text-slate-500 mb-2">Meshtastic doesn't record the exact path of a text message.
+          A traceroute shows the path packets take to that node right now.</p>
+        <div id="route-traces" class="space-y-2 text-sm"></div>
+        <div class="flex gap-2 mt-2">
+          <select id="route-target" class="border rounded px-2 py-1 flex-1 text-sm"></select>
+          <button id="route-run" class="bg-emerald-600 hover:bg-emerald-700 text-white rounded px-3 py-1 text-sm">Run traceroute</button>
+        </div>
+        <p id="route-error" class="text-sm text-red-600 hidden mt-1"></p>
+      </section>
+    </div>
+  </dialog>
+
 <script>
 const $ = (id) => document.getElementById(id);
 let lastId = 0;
@@ -54,6 +79,11 @@ function addMessage(m) {
                new Date(m.created_at * 1000).toLocaleString() +
                (m.rx_snr != null ? ` · SNR ${m.rx_snr}` : "");
   bubble.append(el("div", "text-xs text-slate-500", meta), el("div", "whitespace-pre-wrap break-words", m.text));
+  if (out) {
+    const btn = el("button", "text-xs text-emerald-700 hover:underline mt-1", "Route ▸");
+    btn.addEventListener("click", () => openRoute(m.id));
+    bubble.append(btn);
+  }
   wrap.append(bubble);
   $("messages").append(wrap);
 }
@@ -84,6 +114,7 @@ async function pollStatus() {
 async function loadNodes() {
   try {
     const nodes = await (await fetch("/api/nodes")).json();
+    knownNodes = nodes;
     const sel = $("to"), current = sel.value;
     sel.replaceChildren(el("option", null, "Everyone (broadcast)"));
     sel.firstChild.value = "^all";
@@ -114,6 +145,113 @@ $("send").addEventListener("submit", async (ev) => {
     err.textContent = typeof body.detail === "string" ? body.detail : `Send failed (${res.status})`;
     err.classList.remove("hidden");
   }
+});
+
+// --- route menu ---------------------------------------------------------------
+
+let routeMsgId = null, routeTimer = null, knownNodes = [];
+
+const nodeLabel = (id, name) => name ? `${name} (${id})` : id;
+const isBroadcast = (to) => to === "^all" || to === "!ffffffff";
+
+function hopChain(hops) {
+  const row = el("div", "flex flex-wrap items-center gap-1");
+  hops.forEach((h, i) => {
+    if (i) row.append(el("span", "text-slate-400", h.snr != null ? `→ ${h.snr} dB →` : "→"));
+    row.append(el("span", "bg-slate-100 rounded px-1.5 py-0.5", h.name || h.id));
+  });
+  return row;
+}
+
+function renderRoute(r) {
+  const m = r.message;
+  $("route-text").textContent = m.text;
+
+  const ack = $("route-ack");
+  ack.replaceChildren();
+  const line = (txt, cls = "") => ack.append(el("div", cls, txt));
+  const to = isBroadcast(m.to_id) ? "everyone" : nodeLabel(m.to_id, knownNodes.find((n) => n.id === m.to_id)?.long_name);
+  line(`To ${to} on ch ${m.channel}`, "text-slate-500");
+  switch (m.ack_status) {
+    case "delivered": line(`✓ Delivered — ACK from ${nodeLabel(m.ack_from, r.ack_from_name)}`, "text-emerald-700"); break;
+    case "relayed":   line("✓ Sent — a neighbouring node was heard rebroadcasting it", "text-emerald-700"); break;
+    case "failed":    line(`✗ Not delivered (${m.ack_error})`, "text-red-600"); break;
+    case "pending":   line("… Waiting for acknowledgement"); break;
+    default:          line("No delivery info (sent before route tracking was added)", "text-slate-500");
+  }
+  if (m.ack_status === "delivered" && m.ack_hops != null) {
+    line(m.ack_hops === 0 ? "ACK came back directly (0 hops)" : `ACK came back over ${m.ack_hops} hop${m.ack_hops > 1 ? "s" : ""}`);
+    if (m.ack_hops > 0 && m.ack_relay != null) {
+      const c = r.relay_candidates;
+      line("Last relay: " + (c.length ? c.map((n) => nodeLabel(n.id, n.name)).join(" or ")
+                                      : `unknown node (…${m.ack_relay.toString(16).padStart(2, "0")})`));
+    }
+  }
+
+  const traces = $("route-traces");
+  traces.replaceChildren();
+  if (!r.traceroutes.length) traces.append(el("p", "text-slate-500", "No traceroutes yet."));
+  r.traceroutes.forEach((t) => {
+    const box = el("div", "border rounded p-2 space-y-1");
+    box.append(el("div", "text-xs text-slate-500",
+      `${nodeLabel(t.target_id, knownNodes.find((n) => n.id === t.target_id)?.long_name)} · ` +
+      new Date(t.created_at * 1000).toLocaleTimeString()));
+    if (t.status === "pending") box.append(el("div", null, "… Waiting for reply"));
+    else if (t.status === "timeout") box.append(el("div", "text-red-600", "✗ No reply"));
+    else if (t.status === "failed") box.append(el("div", "text-red-600", `✗ Failed (${t.error})`));
+    else {
+      box.append(el("div", "text-xs text-slate-500", "There:"), hopChain(t.towards));
+      if (t.back) box.append(el("div", "text-xs text-slate-500", "Back:"), hopChain(t.back));
+    }
+    traces.append(box);
+  });
+
+  // Broadcasts have no single destination, so let the user pick one.
+  const sel = $("route-target");
+  if (!sel.options.length) {
+    const targets = isBroadcast(m.to_id) ? knownNodes : [{ id: m.to_id, long_name: knownNodes.find((n) => n.id === m.to_id)?.long_name }];
+    targets.forEach((n) => { const o = el("option", null, nodeLabel(n.id, n.long_name)); o.value = n.id; sel.append(o); });
+    sel.disabled = !isBroadcast(m.to_id);
+  }
+  const pending = r.traceroutes.some((t) => t.status === "pending");
+  $("route-run").disabled = pending || !sel.options.length;
+  $("route-run").classList.toggle("opacity-50", $("route-run").disabled);
+}
+
+async function refreshRoute() {
+  if (routeMsgId == null) return;
+  try {
+    const r = await (await fetch(`/api/messages/${routeMsgId}/route`)).json();
+    renderRoute(r);
+  } catch (e) {}
+}
+
+async function openRoute(id) {
+  routeMsgId = id;
+  $("route-target").replaceChildren();
+  $("route-error").classList.add("hidden");
+  $("route").showModal();
+  await refreshRoute();
+  routeTimer = setInterval(refreshRoute, 2000);
+}
+
+$("route").addEventListener("close", () => { clearInterval(routeTimer); routeMsgId = null; });
+$("route-close").addEventListener("click", () => $("route").close());
+
+$("route-run").addEventListener("click", async () => {
+  const err = $("route-error");
+  err.classList.add("hidden");
+  const res = await fetch(`/api/messages/${routeMsgId}/traceroute`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ to: $("route-target").value }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    err.textContent = typeof body.detail === "string" ? body.detail : `Traceroute failed (${res.status})`;
+    err.classList.remove("hidden");
+  }
+  await refreshRoute();
 });
 
 pollStatus(); pollMessages(); loadNodes();

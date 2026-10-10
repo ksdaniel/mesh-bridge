@@ -25,6 +25,8 @@ the node's IP changes. Messages are kept in `./data/messages.db`.
 | GET    | `/api/messages` | Stored messages, oldest first. `?since_id=N` returns only newer ones, `?limit=` caps the count (default 200) |
 | POST   | `/api/messages` | Send a message: `{"text": "hi", "to": "^all", "channel": 0}`. `to` is `^all` or a node id like `!1d69cba4` |
 | GET    | `/api/nodes`    | Nodes the radio knows about |
+| GET    | `/api/messages/{id}/route` | Delivery info for a sent message (ACK status, hop count, last relay) and its traceroutes |
+| POST   | `/api/messages/{id}/traceroute` | Start a traceroute: `{"to": "!1d69cba4"}`. `to` defaults to the message's destination and is required for broadcasts |
 
 Interactive docs: http://localhost:8000/docs
 
