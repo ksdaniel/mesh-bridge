@@ -5,7 +5,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 
-ENV MESHTASTIC_HOST=10.0.0.153 \
+ENV MESHTASTIC_HOST=192.168.100.102 \
     DB_PATH=/data/messages.db \
     PYTHONUNBUFFERED=1
 VOLUME /data
