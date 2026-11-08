@@ -17,6 +17,18 @@ the node's IP changes. Messages are kept in `./data/messages.db`.
 > drops the previous one. While the bridge runs, don't point the phone app or
 > `meshtastic --host` at the same node, or they will keep kicking each other off.
 
+## Map
+
+The **Map** tab (http://localhost:8000/#map) plots every node with a known
+position, coloured by how many hops away it is. It draws:
+
+- **Radio links**: nodes our radio hears directly (solid), plus links that
+  other nodes report through the NeighborInfo module (dashed). Nodes only send
+  NeighborInfo if that module is enabled on them.
+- **Traceroutes**: click a node and run a traceroute; the path it finds is drawn
+  thick on the way out and thin on the way back. Hops without a position are
+  skipped and the segment over them is dotted.
+
 ## API
 
 | Method | Path            | Description |
@@ -27,6 +39,8 @@ the node's IP changes. Messages are kept in `./data/messages.db`.
 | GET    | `/api/nodes`    | Nodes the radio knows about |
 | GET    | `/api/messages/{id}/route` | Delivery info for a sent message (ACK status, hop count, last relay) and its traceroutes |
 | POST   | `/api/messages/{id}/traceroute` | Start a traceroute: `{"to": "!1d69cba4"}`. `to` defaults to the message's destination and is required for broadcasts |
+| POST   | `/api/nodes/{id}/traceroute` | Start a traceroute to a node, not tied to a message (used by the map) |
+| GET    | `/api/map`      | Nodes with positions and hop distance, radio links, and the latest traceroute to each traced node |
 
 Interactive docs: http://localhost:8000/docs
 

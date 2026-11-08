@@ -58,16 +58,33 @@ class Store:
                          ("ack_hops", "INTEGER"), ("ack_relay", "INTEGER")]:
             if col not in have:
                 self.db.execute(f"ALTER TABLE messages ADD COLUMN {col} {typ}")
+        # message_id used to be NOT NULL; traceroutes started from the map have none.
+        tr_cols = {r["name"]: r for r in self.db.execute("PRAGMA table_info(traceroutes)")}
+        rebuild = bool(tr_cols) and tr_cols["message_id"]["notnull"]
+        if rebuild:
+            self.db.execute("ALTER TABLE traceroutes RENAME TO traceroutes_old")
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS traceroutes (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id INTEGER NOT NULL REFERENCES messages(id),
+                message_id INTEGER REFERENCES messages(id),  -- NULL when started from the map
                 target_id  TEXT NOT NULL,
                 status     TEXT NOT NULL,          -- pending | done | failed | timeout
                 error      TEXT,
                 towards    TEXT,                   -- JSON [{id, name, snr}], us -> target
                 back       TEXT,                   -- JSON [{id, name, snr}], target -> us
                 created_at INTEGER NOT NULL
+            )""")
+        if rebuild:
+            self.db.execute("INSERT INTO traceroutes SELECT * FROM traceroutes_old")
+            self.db.execute("DROP TABLE traceroutes_old")
+        # Links reported by nodes running the NeighborInfo module.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS neighbors (
+                node_id     TEXT NOT NULL,
+                neighbor_id TEXT NOT NULL,
+                snr         REAL,
+                updated_at  INTEGER NOT NULL,
+                PRIMARY KEY (node_id, neighbor_id)
             )""")
         self.db.commit()
 
@@ -95,7 +112,7 @@ class Store:
                             (*fields.values(), packet_id))
             self.db.commit()
 
-    def add_traceroute(self, message_id: int, target_id: str) -> int:
+    def add_traceroute(self, message_id: int | None, target_id: str) -> int:
         with self.lock:
             cur = self.db.execute(
                 "INSERT INTO traceroutes (message_id, target_id, status, created_at) VALUES (?, ?, 'pending', ?)",
@@ -110,14 +127,13 @@ class Store:
             self.db.execute(f"UPDATE traceroutes SET {sets} WHERE id = ?", (*fields.values(), tr_id))
             self.db.commit()
 
-    def traceroutes(self, message_id: int) -> list[dict]:
+    def _traceroute_rows(self, where: str, args: tuple) -> list[dict]:
         with self.lock:
             self.db.execute(
                 "UPDATE traceroutes SET status = 'timeout' WHERE status = 'pending' AND created_at < ?",
                 (int(time.time()) - TRACEROUTE_TIMEOUT,))
             self.db.commit()
-            rows = self.db.execute(
-                "SELECT * FROM traceroutes WHERE message_id = ? ORDER BY id", (message_id,)).fetchall()
+            rows = self.db.execute(f"SELECT * FROM traceroutes WHERE {where} ORDER BY id", args).fetchall()
         out = []
         for r in rows:
             r = dict(r)
@@ -125,6 +141,31 @@ class Store:
             r["back"] = json.loads(r["back"]) if r["back"] else None
             out.append(r)
         return out
+
+    def traceroutes(self, message_id: int) -> list[dict]:
+        return self._traceroute_rows("message_id = ?", (message_id,))
+
+    def latest_traceroutes(self) -> list[dict]:
+        """Per target: the newest traceroute (to show whether one is running)
+        and the newest successful one (the route drawn on the map)."""
+        return self._traceroute_rows(
+            "id IN (SELECT MAX(id) FROM traceroutes GROUP BY target_id)"
+            " OR id IN (SELECT MAX(id) FROM traceroutes WHERE status = 'done' GROUP BY target_id)", ())
+
+    def set_neighbors(self, node_id: str, neighbors: list[tuple[str, float | None]]):
+        now = int(time.time())
+        with self.lock:
+            self.db.execute("DELETE FROM neighbors WHERE node_id = ?", (node_id,))
+            self.db.executemany(
+                "INSERT OR REPLACE INTO neighbors (node_id, neighbor_id, snr, updated_at) VALUES (?, ?, ?, ?)",
+                [(node_id, nb, snr, now) for nb, snr in neighbors])
+            self.db.commit()
+
+    def neighbors(self, max_age: int) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute("SELECT * FROM neighbors WHERE updated_at > ?",
+                                   (int(time.time()) - max_age,)).fetchall()
+        return [dict(r) for r in rows]
 
     def list(self, since_id: int, limit: int) -> list[dict]:
         with self.lock:
@@ -145,6 +186,7 @@ class Radio:
         self.iface = None
         self.lost = threading.Event()
         pub.subscribe(self._on_text, "meshtastic.receive.text")
+        pub.subscribe(self._on_neighborinfo, "meshtastic.receive.neighborinfo")
         pub.subscribe(self._on_lost, "meshtastic.connection.lost")
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -188,6 +230,13 @@ class Radio:
         if msg:
             log.info("Message from %s: %s", from_id, msg["text"])
 
+    def _on_neighborinfo(self, packet, interface):
+        info = packet["decoded"]["neighborinfo"]
+        node_id = f"!{info.get('nodeId', packet['from']):08x}"
+        neighbors = [(f"!{n['nodeId']:08x}", n.get("snr")) for n in info.get("neighbors", [])]
+        self.store.set_neighbors(node_id, neighbors)
+        log.info("Neighbour info from %s: %d neighbours", node_id, len(neighbors))
+
     @property
     def connected(self) -> bool:
         return self.iface is not None and not self.lost.is_set()
@@ -214,11 +263,24 @@ class Radio:
 
     def nodes(self) -> list[dict]:
         nodes = (self.iface.nodes or {}).values() if self.iface else []
-        return [
-            {"id": n["user"]["id"], "long_name": n["user"].get("longName"),
-             "short_name": n["user"].get("shortName"), "last_heard": n.get("lastHeard")}
-            for n in nodes if "user" in n
-        ]
+        me = self.my_id
+        out = []
+        for n in nodes:
+            if "user" not in n:
+                continue
+            pos = n.get("position", {})
+            has_pos = pos.get("latitude") and pos.get("longitude")  # 0/0 means "no fix"
+            out.append({
+                "id": n["user"]["id"], "long_name": n["user"].get("longName"),
+                "short_name": n["user"].get("shortName"), "last_heard": n.get("lastHeard"),
+                "is_me": n["user"]["id"] == me,
+                "hops_away": 0 if n["user"]["id"] == me else n.get("hopsAway"),
+                "snr": n.get("snr"),
+                "lat": pos["latitude"] if has_pos else None,
+                "lon": pos["longitude"] if has_pos else None,
+                "altitude": pos.get("altitude"),
+            })
+        return out
 
     def send(self, text: str, to: str, channel: int) -> dict:
         if not self.connected:
@@ -260,7 +322,7 @@ class Radio:
             ack_relay=packet.get("relayNode"),
         )
 
-    def traceroute(self, message_id: int, target: str, channel: int) -> int:
+    def traceroute(self, message_id: int | None, target: str, channel: int) -> int:
         if not self.connected:
             raise HTTPException(503, "Not connected to the Meshtastic node")
         tr_id = self.store.add_traceroute(message_id, target)
@@ -370,6 +432,35 @@ def start_traceroute(msg_id: int, req: TracerouteRequest):
 @app.get("/api/nodes")
 def list_nodes():
     return radio.nodes()
+
+
+@app.post("/api/nodes/{node_id}/traceroute", status_code=202)
+def trace_node(node_id: str):
+    if node_id in ("^all", "!ffffffff"):
+        raise HTTPException(422, "Pick a node to trace to")
+    return {"id": radio.traceroute(None, node_id, 0)}
+
+
+NEIGHBOR_MAX_AGE = 48 * 3600  # neighbour reports older than this are left off the map
+
+
+@app.get("/api/map")
+def map_data():
+    """Everything the map needs: nodes (with positions where known), links
+    between nodes, and the latest traceroute to each traced node."""
+    nodes = radio.nodes()
+    me = next((n["id"] for n in nodes if n["is_me"]), None)
+    links = {}
+    # Nodes our radio hears directly; SNR is how well we hear them.
+    for n in nodes:
+        if me and not n["is_me"] and n["hops_away"] == 0:
+            links[frozenset((me, n["id"]))] = {"a": me, "b": n["id"], "snr": n["snr"], "source": "direct"}
+    for nb in store.neighbors(NEIGHBOR_MAX_AGE):
+        key = frozenset((nb["node_id"], nb["neighbor_id"]))
+        links.setdefault(key, {"a": nb["node_id"], "b": nb["neighbor_id"], "snr": nb["snr"],
+                               "source": "neighborinfo", "updated_at": nb["updated_at"]})
+    return {"me": me, "nodes": nodes, "links": list(links.values()),
+            "traceroutes": store.latest_traceroutes()}
 
 
 @app.get("/")

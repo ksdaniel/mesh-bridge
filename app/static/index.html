@@ -5,14 +5,28 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Mesh Bridge</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    #map .leaflet-tile-pane { filter: grayscale(1) contrast(1.15); }  /* black & white basemap */
+    #map .leaflet-popup-content { margin: 10px 12px; min-width: 200px; }
+    #map .leaflet-interactive:focus { outline: none; }
+  </style>
 </head>
 <body class="bg-slate-100 text-slate-800">
-  <div class="max-w-2xl mx-auto p-4 flex flex-col h-screen">
-    <header class="flex items-center justify-between mb-3">
-      <h1 class="text-xl font-semibold">Mesh Bridge</h1>
-      <span id="status" class="text-sm px-2 py-1 rounded bg-slate-300">connecting…</span>
+  <div id="app" class="max-w-2xl mx-auto p-4 flex flex-col h-screen">
+    <header class="flex items-center justify-between gap-2 mb-3">
+      <div class="flex items-center gap-3 shrink-0">
+        <h1 class="text-xl font-semibold whitespace-nowrap">Mesh Bridge</h1>
+        <nav class="flex text-sm bg-slate-200 rounded p-0.5">
+          <a href="#" data-view="chat" class="px-2 py-0.5 rounded">Messages</a>
+          <a href="#map" data-view="map" class="px-2 py-0.5 rounded">Map</a>
+        </nav>
+      </div>
+      <span id="status" class="text-sm px-2 py-1 rounded bg-slate-300 truncate min-w-0">connecting…</span>
     </header>
 
+    <div id="chat-view" class="flex-1 flex flex-col min-h-0">
     <main id="messages" class="flex-1 overflow-y-auto space-y-2 bg-white rounded-lg shadow p-3"></main>
 
     <form id="send" class="mt-3 bg-white rounded-lg shadow p-3 space-y-2">
@@ -32,6 +46,26 @@
       </div>
       <p id="error" class="text-sm text-red-600 hidden"></p>
     </form>
+    </div>
+
+    <div id="map-view" class="hidden flex-1 flex flex-col gap-2 min-h-0">
+      <div id="map" class="flex-1 min-h-[300px] rounded-lg shadow bg-white"></div>
+      <div class="bg-white rounded-lg shadow px-3 py-2 text-xs text-slate-600 space-y-1">
+        <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <span class="flex items-center gap-1"><i class="inline-block w-3 h-3 rounded-full border-[3px] border-black bg-emerald-600"></i>this node</span>
+          <span class="flex items-center gap-1"><i class="inline-block w-3 h-3 rounded-full bg-emerald-600"></i>direct</span>
+          <span class="flex items-center gap-1"><i class="inline-block w-3 h-3 rounded-full bg-amber-600"></i>1 hop</span>
+          <span class="flex items-center gap-1"><i class="inline-block w-3 h-3 rounded-full bg-orange-600"></i>2 hops</span>
+          <span class="flex items-center gap-1"><i class="inline-block w-3 h-3 rounded-full bg-red-600"></i>3+ hops</span>
+          <span class="flex items-center gap-1"><i class="inline-block w-3 h-3 rounded-full bg-slate-500"></i>unknown</span>
+          <span class="flex items-center gap-1"><i class="inline-block w-5 border-t-2 border-slate-600"></i>heard directly</span>
+          <span class="flex items-center gap-1"><i class="inline-block w-5 border-t-2 border-dashed border-slate-400"></i>neighbour report</span>
+          <span class="flex items-center gap-1"><i class="inline-block w-5 border-t-4 border-blue-600"></i>traceroute (thin = way back)</span>
+        </div>
+        <p class="text-slate-500">Click a node to run a traceroute to it; the path it finds is drawn on the map.</p>
+        <p id="map-unplaced" class="text-slate-500"></p>
+      </div>
+    </div>
   </div>
 
   <dialog id="route" class="rounded-lg shadow-xl p-0 w-[min(32rem,calc(100vw-2rem))] backdrop:bg-black/40">
@@ -104,10 +138,10 @@ async function pollStatus() {
   try {
     const st = await (await fetch("/api/status")).json();
     s.textContent = st.connected ? `${st.node_name || st.node_id} @ ${st.host}` : `offline (${st.host})`;
-    s.className = "text-sm px-2 py-1 rounded " + (st.connected ? "bg-emerald-200" : "bg-red-200");
+    s.className = "text-sm px-2 py-1 rounded truncate min-w-0 " + (st.connected ? "bg-emerald-200" : "bg-red-200");
   } catch (e) {
     s.textContent = "server unreachable";
-    s.className = "text-sm px-2 py-1 rounded bg-red-200";
+    s.className = "text-sm px-2 py-1 rounded truncate min-w-0 bg-red-200";
   }
 }
 
@@ -253,6 +287,188 @@ $("route-run").addEventListener("click", async () => {
   }
   await refreshRoute();
 });
+
+// --- map ----------------------------------------------------------------------
+
+let map = null, mapTimer = null, mapFitted = false;
+const panes = {}, nodeMarkers = new Map();
+const HOP_COLORS = ["#059669", "#d97706", "#ea580c", "#dc2626"];  // direct, 1, 2, 3+ hops
+const ROUTE_COLORS = ["#2563eb", "#db2777", "#7c3aed", "#0891b2", "#ca8a04", "#4f46e5"];
+const hopColor = (h) => h == null ? "#64748b" : HOP_COLORS[Math.min(h, 3)];
+
+function ago(ts) {
+  if (!ts) return "never";
+  const s = Date.now() / 1000 - ts;
+  if (s < 90) return "just now";
+  if (s < 5400) return `${Math.round(s / 60)} min ago`;
+  if (s < 129600) return `${Math.round(s / 3600)} h ago`;
+  return `${Math.round(s / 86400)} days ago`;
+}
+
+function initMap() {
+  map = L.map("map", { worldCopyJump: true }).setView([20, 0], 2);
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+  }).addTo(map);
+  // Separate panes keep nodes drawn above lines no matter what order layers are redrawn in.
+  [["links", 410], ["routes", 420], ["nodes", 430]].forEach(([name, z]) => {
+    map.createPane(name).style.zIndex = z;
+  });
+  panes.links = L.layerGroup().addTo(map);
+  panes.routes = L.layerGroup().addTo(map);
+  panes.nodes = L.layerGroup().addTo(map);
+  L.control.layers(null, { "Nodes": panes.nodes, "Radio links": panes.links, "Traceroutes": panes.routes },
+                   { collapsed: window.innerWidth < 640, position: "topright" }).addTo(map);
+}
+
+function nodePopup(n, trace, lastDone) {
+  const box = el("div", "space-y-1 text-sm");
+  box.append(el("div", "font-semibold", n.long_name || n.id));
+  box.append(el("div", "text-xs text-slate-500", [n.short_name, n.id].filter(Boolean).join(" · ")));
+  const hops = n.is_me ? "This node" : n.hops_away == null ? "Distance unknown"
+             : n.hops_away === 0 ? "Heard directly" : `${n.hops_away} hop${n.hops_away > 1 ? "s" : ""} away`;
+  box.append(el("div", null, hops + (!n.is_me && n.hops_away === 0 && n.snr != null ? ` · SNR ${n.snr} dB` : "")));
+  if (!n.is_me) box.append(el("div", "text-xs text-slate-500", `Last heard ${ago(n.last_heard)}`));
+  box.append(el("div", "text-xs text-slate-500",
+    `${n.lat.toFixed(5)}, ${n.lon.toFixed(5)}` + (n.altitude != null ? ` · ${n.altitude} m` : "")));
+  if (n.is_me) return box;
+
+  if (trace?.status === "pending") box.append(el("div", null, "… Tracing route"));
+  else if (trace?.status === "timeout") box.append(el("div", "text-red-600", "✗ Last traceroute got no reply"));
+  else if (trace?.status === "failed") box.append(el("div", "text-red-600", `✗ Last traceroute failed (${trace.error})`));
+  if (lastDone) {
+    box.append(el("div", "text-xs text-slate-500 pt-1", `Route traced ${ago(lastDone.created_at)}:`), hopChain(lastDone.towards));
+  }
+  const btn = el("button", "mt-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded px-3 py-1 text-sm",
+                 lastDone ? "Trace again" : "Traceroute");
+  btn.disabled = trace?.status === "pending";
+  btn.classList.toggle("opacity-50", btn.disabled);
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    btn.classList.add("opacity-50");
+    const res = await fetch(`/api/nodes/${encodeURIComponent(n.id)}/traceroute`, { method: "POST" });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      box.append(el("div", "text-red-600", typeof body.detail === "string" ? body.detail : `Traceroute failed (${res.status})`));
+    }
+    refreshMap();
+  });
+  box.append(btn);
+  return box;
+}
+
+// Draw a traced path. Hops without a known position are skipped, and the
+// segment that jumps over them is dotted.
+function drawPath(hops, byId, color, back, label) {
+  let prev = null, skipped = [];
+  hops.forEach((h) => {
+    const n = byId[h.id];
+    if (!n || n.lat == null) { if (prev) skipped.push(h.name || h.id); return; }
+    if (prev) {
+      const line = L.polyline([[prev.lat, prev.lon], [n.lat, n.lon]], {
+        pane: "routes", color, weight: back ? 2 : 4, opacity: 0.85,
+        dashArray: skipped.length ? "2 7" : null,
+      });
+      const via = skipped.length ? ` (via ${skipped.join(", ")}, no position)` : "";
+      const snr = !skipped.length && h.snr != null ? ` · ${h.snr} dB` : "";
+      line.bindTooltip(`${label}${back ? " (way back)" : ""}: ${prev.long_name || prev.id} → ${n.long_name || n.id}${via}${snr}`, { sticky: true });
+      panes.routes.addLayer(line);
+    }
+    prev = n; skipped = [];
+  });
+}
+
+function renderMap(data) {
+  const byId = Object.fromEntries(data.nodes.map((n) => [n.id, n]));
+  const placed = data.nodes.filter((n) => n.lat != null);
+
+  // Latest attempt and latest successful route per traced node.
+  const latest = {}, lastDone = {};
+  data.traceroutes.forEach((t) => {
+    if (!latest[t.target_id] || t.id > latest[t.target_id].id) latest[t.target_id] = t;
+    if (t.status === "done" && (!lastDone[t.target_id] || t.id > lastDone[t.target_id].id)) lastDone[t.target_id] = t;
+  });
+
+  panes.links.clearLayers();
+  data.links.forEach((l) => {
+    const a = byId[l.a], b = byId[l.b];
+    if (!a || !b || a.lat == null || b.lat == null) return;
+    const direct = l.source === "direct";
+    L.polyline([[a.lat, a.lon], [b.lat, b.lon]], {
+      pane: "links", color: direct ? "#475569" : "#94a3b8", weight: 2, opacity: 0.8, dashArray: direct ? null : "5 5",
+    }).bindTooltip(
+      `${a.long_name || a.id} ↔ ${b.long_name || b.id}` + (l.snr != null ? ` · SNR ${l.snr} dB` : "") +
+      (direct ? " · heard directly by this node" : ` · reported by ${a.long_name || a.id} ${ago(l.updated_at)}`),
+      { sticky: true }).addTo(panes.links);
+  });
+
+  panes.routes.clearLayers();
+  Object.values(lastDone).sort((x, y) => x.id - y.id).forEach((t, i) => {
+    const color = ROUTE_COLORS[i % ROUTE_COLORS.length];
+    const label = `Route to ${byId[t.target_id]?.long_name || t.target_id}`;
+    drawPath(t.towards, byId, color, false, label);
+    if (t.back) drawPath(t.back, byId, color, true, label);
+  });
+
+  // Markers are updated in place so an open popup survives the refresh.
+  const seen = new Set();
+  placed.forEach((n) => {
+    seen.add(n.id);
+    const style = {
+      pane: "nodes", radius: n.is_me ? 9 : 7, fillColor: hopColor(n.hops_away), fillOpacity: 0.95,
+      color: n.is_me ? "#000" : "#fff", weight: n.is_me ? 3 : 2,
+    };
+    let m = nodeMarkers.get(n.id);
+    if (!m) {
+      m = L.circleMarker([n.lat, n.lon], style).bindPopup("").bindTooltip("", { direction: "top", offset: [0, -8] });
+      nodeMarkers.set(n.id, m);
+      panes.nodes.addLayer(m);
+    }
+    m.setLatLng([n.lat, n.lon]).setStyle(style);
+    m.setTooltipContent(n.long_name || n.id);
+    m.setPopupContent(nodePopup(n, latest[n.id], lastDone[n.id]));
+  });
+  nodeMarkers.forEach((m, id) => { if (!seen.has(id)) { panes.nodes.removeLayer(m); nodeMarkers.delete(id); } });
+
+  const unplaced = data.nodes.filter((n) => n.lat == null);
+  $("map-unplaced").textContent = unplaced.length
+    ? `${unplaced.length} node${unplaced.length > 1 ? "s" : ""} without a known position: ` +
+      unplaced.map((n) => n.long_name || n.id).join(", ")
+    : "";
+
+  if (!mapFitted && placed.length) {
+    map.fitBounds(L.latLngBounds(placed.map((n) => [n.lat, n.lon])), { padding: [40, 40], maxZoom: 13 });
+    mapFitted = true;
+  }
+}
+
+async function refreshMap() {
+  try {
+    renderMap(await (await fetch("/api/map")).json());
+  } catch (e) {}
+}
+
+function showView(view) {
+  const isMap = view === "map";
+  $("chat-view").classList.toggle("hidden", isMap);
+  $("map-view").classList.toggle("hidden", !isMap);
+  $("app").classList.toggle("max-w-2xl", !isMap);
+  $("app").classList.toggle("max-w-6xl", isMap);
+  document.querySelectorAll("nav [data-view]").forEach((a) => {
+    a.classList.toggle("bg-white", a.dataset.view === view);
+    a.classList.toggle("shadow", a.dataset.view === view);
+  });
+  clearInterval(mapTimer);
+  if (isMap) {
+    if (!map) initMap();
+    map.invalidateSize();
+    refreshMap();
+    mapTimer = setInterval(refreshMap, 5000);
+  }
+}
+
+window.addEventListener("hashchange", () => showView(location.hash === "#map" ? "map" : "chat"));
+showView(location.hash === "#map" ? "map" : "chat");
 
 pollStatus(); pollMessages(); loadNodes();
 setInterval(pollMessages, 3000);
