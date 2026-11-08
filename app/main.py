@@ -23,6 +23,7 @@ RECONNECT_SECONDS = 10
 MAX_PAYLOAD_BYTES = 228  # Meshtastic text payload limit
 TRACEROUTE_TIMEOUT = 120  # seconds before a traceroute with no reply counts as lost
 UNKNOWN_SNR = -128
+PACKET_LOG_MAX = int(os.getenv("PACKET_LOG_MAX", "50000"))  # oldest packets beyond this are dropped
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mesh-bridge")
@@ -77,6 +78,26 @@ class Store:
         if rebuild:
             self.db.execute("INSERT INTO traceroutes SELECT * FROM traceroutes_old")
             self.db.execute("DROP TABLE traceroutes_old")
+        # Every packet heard over the radio, for the log page.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS packets (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                packet_id  INTEGER,
+                from_id    TEXT,
+                from_name  TEXT,
+                to_id      TEXT,
+                channel    INTEGER,
+                portnum    TEXT NOT NULL,          -- e.g. TEXT_MESSAGE_APP, or ENCRYPTED
+                rx_snr     REAL,
+                rx_rssi    INTEGER,
+                hops       INTEGER,
+                via_mqtt   INTEGER,
+                data       TEXT NOT NULL,          -- JSON of the whole packet
+                created_at INTEGER NOT NULL
+            )""")
+        self.db.execute("CREATE INDEX IF NOT EXISTS packets_portnum ON packets (portnum, id)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS packets_from ON packets (from_id, id)")
+        self.packet_inserts = 0
         # Links reported by nodes running the NeighborInfo module.
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS neighbors (
@@ -161,6 +182,44 @@ class Store:
                 [(node_id, nb, snr, now) for nb, snr in neighbors])
             self.db.commit()
 
+    def add_packet(self, **pkt):
+        cols = ", ".join(pkt)
+        marks = ", ".join("?" for _ in pkt)
+        with self.lock:
+            self.db.execute(f"INSERT INTO packets ({cols}) VALUES ({marks})", tuple(pkt.values()))
+            self.packet_inserts += 1
+            if self.packet_inserts % 500 == 0:
+                self.db.execute("DELETE FROM packets WHERE id <= (SELECT MAX(id) FROM packets) - ?",
+                                (PACKET_LOG_MAX,))
+            self.db.commit()
+
+    def packets(self, since_id: int, before_id: int | None, limit: int,
+                portnum: str | None, from_id: str | None) -> list[dict]:
+        """Newest first. since_id returns only newer packets, before_id pages back."""
+        where, args = ["id > ?"], [since_id]
+        if before_id is not None:
+            where.append("id < ?"); args.append(before_id)
+        if portnum:
+            where.append("portnum = ?"); args.append(portnum)
+        if from_id:
+            where.append("from_id = ?"); args.append(from_id)
+        with self.lock:
+            rows = self.db.execute(
+                f"SELECT * FROM packets WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT ?",
+                (*args, limit)).fetchall()
+        out = []
+        for r in rows:
+            r = dict(r)
+            r["data"] = json.loads(r["data"])
+            out.append(r)
+        return out
+
+    def packet_types(self) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT portnum, COUNT(*) AS count FROM packets GROUP BY portnum ORDER BY count DESC").fetchall()
+        return [dict(r) for r in rows]
+
     def neighbors(self, max_age: int) -> list[dict]:
         with self.lock:
             rows = self.db.execute("SELECT * FROM neighbors WHERE updated_at > ?",
@@ -177,6 +236,19 @@ class Store:
 
 # --- radio connection --------------------------------------------------------
 
+def _jsonable(v):
+    """Packet dicts carry raw protobufs and bytes; keep only what JSON can hold."""
+    if isinstance(v, dict):
+        return {k: _jsonable(x) for k, x in v.items() if k != "raw"}
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    if isinstance(v, bytes):
+        return v.hex()
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    return str(v)
+
+
 class Radio:
     """Keeps a TCP connection to the node open, reconnecting when it drops."""
 
@@ -187,6 +259,7 @@ class Radio:
         self.lost = threading.Event()
         pub.subscribe(self._on_text, "meshtastic.receive.text")
         pub.subscribe(self._on_neighborinfo, "meshtastic.receive.neighborinfo")
+        pub.subscribe(self._on_packet, "meshtastic.receive")  # parent topic: every packet
         pub.subscribe(self._on_lost, "meshtastic.connection.lost")
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -229,6 +302,28 @@ class Radio:
         )
         if msg:
             log.info("Message from %s: %s", from_id, msg["text"])
+
+    def _on_packet(self, packet, interface):
+        try:
+            from_id = packet.get("fromId") or f"!{packet.get('from', 0):08x}"
+            decoded = packet.get("decoded")
+            hops = packet["hopStart"] - packet.get("hopLimit", 0) if "hopStart" in packet else None
+            self.store.add_packet(
+                packet_id=packet.get("id"),
+                from_id=from_id,
+                from_name=self.node_name(from_id),
+                to_id=packet.get("toId") or f"!{packet.get('to', 0):08x}",
+                channel=packet.get("channel", 0),
+                portnum=decoded.get("portnum", "UNKNOWN_APP") if decoded else "ENCRYPTED",
+                rx_snr=packet.get("rxSnr"),
+                rx_rssi=packet.get("rxRssi"),
+                hops=hops,
+                via_mqtt=1 if packet.get("viaMqtt") else 0,
+                data=json.dumps(_jsonable(packet)),
+                created_at=int(packet.get("rxTime") or time.time()),
+            )
+        except Exception:
+            log.exception("Could not log packet")
 
     def _on_neighborinfo(self, packet, interface):
         info = packet["decoded"]["neighborinfo"]
@@ -432,6 +527,21 @@ def start_traceroute(msg_id: int, req: TracerouteRequest):
 @app.get("/api/nodes")
 def list_nodes():
     return radio.nodes()
+
+
+@app.get("/api/packets")
+def list_packets(since_id: int = 0, before_id: int | None = None, limit: int = 100,
+                 portnum: str | None = None, from_id: str | None = None):
+    rows = store.packets(since_id, before_id, min(max(limit, 1), 500), portnum, from_id)
+    for r in rows:  # names may have arrived after the packet did
+        r["from_name"] = r["from_name"] or radio.node_name(r["from_id"])
+        r["to_name"] = radio.node_name(r["to_id"])
+    return rows
+
+
+@app.get("/api/packets/types")
+def packet_types():
+    return store.packet_types()
 
 
 @app.post("/api/nodes/{node_id}/traceroute", status_code=202)

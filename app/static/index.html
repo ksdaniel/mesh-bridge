@@ -14,19 +14,20 @@
   </style>
 </head>
 <body class="bg-slate-100 text-slate-800">
-  <div id="app" class="max-w-2xl mx-auto p-4 flex flex-col h-screen">
+  <div id="app" class="max-w-6xl mx-auto p-4 flex flex-col h-screen">
     <header class="flex items-center justify-between gap-2 mb-3">
       <div class="flex items-center gap-3 shrink-0">
         <h1 class="text-xl font-semibold whitespace-nowrap">Mesh Bridge</h1>
         <nav class="flex text-sm bg-slate-200 rounded p-0.5">
           <a href="#" data-view="chat" class="px-2 py-0.5 rounded">Messages</a>
           <a href="#map" data-view="map" class="px-2 py-0.5 rounded">Map</a>
+          <a href="#log" data-view="log" class="px-2 py-0.5 rounded">Log</a>
         </nav>
       </div>
       <span id="status" class="text-sm px-2 py-1 rounded bg-slate-300 truncate min-w-0">connecting…</span>
     </header>
 
-    <div id="chat-view" class="flex-1 flex flex-col min-h-0">
+    <div id="chat-view" class="flex-1 flex flex-col min-h-0 w-full max-w-3xl mx-auto">
     <main id="messages" class="flex-1 overflow-y-auto space-y-2 bg-white rounded-lg shadow p-3"></main>
 
     <form id="send" class="mt-3 bg-white rounded-lg shadow p-3 space-y-2">
@@ -41,7 +42,7 @@
         </select>
       </div>
       <div class="flex gap-2">
-        <input id="text" maxlength="228" required placeholder="Message…" class="border rounded px-2 py-1 flex-1">
+        <input id="text" maxlength="228" required placeholder="Message…" class="border rounded px-2 py-1 flex-1 min-w-0">
         <button class="bg-emerald-600 hover:bg-emerald-700 text-white rounded px-4 py-1">Send</button>
       </div>
       <p id="error" class="text-sm text-red-600 hidden"></p>
@@ -65,6 +66,16 @@
         <p class="text-slate-500">Click a node to run a traceroute to it; the path it finds is drawn on the map.</p>
         <p id="map-unplaced" class="text-slate-500"></p>
       </div>
+    </div>
+
+    <div id="log-view" class="hidden flex-1 flex flex-col gap-2 min-h-0">
+      <div class="flex flex-wrap items-center gap-2 bg-white rounded-lg shadow p-2 text-sm">
+        <select id="log-type" class="border rounded px-2 py-1 max-w-[45%]"><option value="">All types</option></select>
+        <select id="log-from" class="border rounded px-2 py-1 max-w-[45%]"><option value="">All nodes</option></select>
+        <label class="flex items-center gap-1"><input type="checkbox" id="log-live" checked> Live</label>
+        <span class="text-xs text-slate-500 ml-auto">Click a row for the full packet</span>
+      </div>
+      <div id="log-list" class="flex-1 overflow-y-auto bg-white rounded-lg shadow"></div>
     </div>
   </div>
 
@@ -138,6 +149,7 @@ async function pollStatus() {
   try {
     const st = await (await fetch("/api/status")).json();
     s.textContent = st.connected ? `${st.node_name || st.node_id} @ ${st.host}` : `offline (${st.host})`;
+    s.title = s.textContent;  // the badge is truncated on narrow screens
     s.className = "text-sm px-2 py-1 rounded truncate min-w-0 " + (st.connected ? "bg-emerald-200" : "bg-red-200");
   } catch (e) {
     s.textContent = "server unreachable";
@@ -158,6 +170,7 @@ async function loadNodes() {
       sel.append(o);
     });
     sel.value = [...sel.options].some((o) => o.value === current) ? current : "^all";
+    if (viewFromHash() === "log") loadLogFilters();
   } catch (e) {}
 }
 
@@ -448,27 +461,213 @@ async function refreshMap() {
   } catch (e) {}
 }
 
+// --- packet log ---------------------------------------------------------------
+
+let logTimer = null, logNewest = 0, logOldest = null, logLoaded = false;
+let logGen = 0;  // bumped on filter change so in-flight fetches for the old filter are dropped
+const LOG_PAGE = 100;
+const PORTS = {
+  TEXT_MESSAGE_APP: ["Text", "bg-emerald-100 text-emerald-800"],
+  POSITION_APP: ["Position", "bg-sky-100 text-sky-800"],
+  NODEINFO_APP: ["Node info", "bg-violet-100 text-violet-800"],
+  TELEMETRY_APP: ["Telemetry", "bg-amber-100 text-amber-800"],
+  ROUTING_APP: ["Routing", "bg-slate-200 text-slate-700"],
+  TRACEROUTE_APP: ["Traceroute", "bg-blue-100 text-blue-800"],
+  NEIGHBORINFO_APP: ["Neighbours", "bg-teal-100 text-teal-800"],
+  WAYPOINT_APP: ["Waypoint", "bg-lime-100 text-lime-800"],
+  STORE_FORWARD_APP: ["Store & fwd", "bg-indigo-100 text-indigo-800"],
+  RANGE_TEST_APP: ["Range test", "bg-pink-100 text-pink-800"],
+  MAP_REPORT_APP: ["Map report", "bg-cyan-100 text-cyan-800"],
+  ENCRYPTED: ["Encrypted", "bg-rose-100 text-rose-800"],
+};
+const portLabel = (p) => PORTS[p]?.[0] || p.replace(/_APP$/, "").replaceAll("_", " ").toLowerCase();
+const nameOf = (id) => knownNodes.find((n) => n.id === id)?.long_name || id;
+const numId = (num) => "!" + (num >>> 0).toString(16).padStart(8, "0");
+const fmt = (v, digits = 1) => typeof v === "number" ? +v.toFixed(digits) : v;
+
+function packetSummary(p) {
+  const d = p.data.decoded || {};
+  switch (p.portnum) {
+    case "TEXT_MESSAGE_APP": return d.text ?? "";
+    case "POSITION_APP": {
+      const q = d.position || {};
+      if (q.latitude == null) return "No position fix";
+      return `${q.latitude.toFixed(5)}, ${q.longitude.toFixed(5)}` +
+             (q.altitude != null ? ` · ${q.altitude} m` : "") + (q.satsInView ? ` · ${q.satsInView} sats` : "");
+    }
+    case "NODEINFO_APP": {
+      const u = d.user || {};
+      return [u.longName, u.shortName && `(${u.shortName})`, u.hwModel, u.role].filter(Boolean).join(" ");
+    }
+    case "TELEMETRY_APP": {
+      const t = d.telemetry || {}, parts = [];
+      const dm = t.deviceMetrics, em = t.environmentMetrics, ls = t.localStats;
+      if (dm) {
+        if (dm.batteryLevel != null) parts.push(dm.batteryLevel > 100 ? "powered" : `battery ${dm.batteryLevel}%`);
+        if (dm.voltage != null) parts.push(`${fmt(dm.voltage, 2)} V`);
+        if (dm.channelUtilization != null) parts.push(`channel ${fmt(dm.channelUtilization)}%`);
+        if (dm.airUtilTx != null) parts.push(`airtime ${fmt(dm.airUtilTx)}%`);
+      }
+      if (em) {
+        if (em.temperature != null) parts.push(`${fmt(em.temperature)} °C`);
+        if (em.relativeHumidity != null) parts.push(`${fmt(em.relativeHumidity)}% RH`);
+        if (em.barometricPressure != null) parts.push(`${fmt(em.barometricPressure)} hPa`);
+      }
+      if (ls) parts.push(`${ls.numOnlineNodes ?? "?"}/${ls.numTotalNodes ?? "?"} nodes online`);
+      return parts.join(" · ") || Object.keys(t).filter((k) => k !== "time").join(", ");
+    }
+    case "ROUTING_APP": {
+      const e = d.routing?.errorReason || "NONE";
+      return (e === "NONE" ? "ACK" : `NAK: ${e}`) + (d.requestId ? ` for packet ${d.requestId}` : "");
+    }
+    case "TRACEROUTE_APP": {
+      const route = (d.traceroute?.route || []).map((n) => nameOf(numId(n)));
+      const kind = d.requestId ? "Reply" : "Request";
+      return route.length ? `${kind} via ${route.join(" → ")}` : `${kind}, no relays`;
+    }
+    case "NEIGHBORINFO_APP": {
+      const nb = d.neighborinfo?.neighbors || [];
+      return `${nb.length} neighbour${nb.length === 1 ? "" : "s"}` +
+             (nb.length ? ": " + nb.map((n) => nameOf(numId(n.nodeId)) + (n.snr != null ? ` (${fmt(n.snr)} dB)` : "")).join(", ") : "");
+    }
+    case "ENCRYPTED": return "Can't decode: this node doesn't have the channel's key";
+    default: return d.payload ? `${d.payload.length / 2} bytes` : "";
+  }
+}
+
+function packetRow(p) {
+  const row = el("div", "px-3 py-2 border-b border-slate-100 hover:bg-slate-50 cursor-pointer");
+  const head = el("div", "flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-500");
+  const t = new Date(p.created_at * 1000);
+  head.append(el("span", "tabular-nums", t.toDateString() === new Date().toDateString() ? t.toLocaleTimeString() : t.toLocaleString()));
+  head.append(el("span", "rounded px-1.5 py-0.5 font-medium " + (PORTS[p.portnum]?.[1] || "bg-slate-100 text-slate-700"), portLabel(p.portnum)));
+  head.append(el("span", "text-slate-700", `${p.from_name || p.from_id} → ${isBroadcast(p.to_id) ? "all" : p.to_name || p.to_id}` +
+                                           (p.channel ? ` · ch ${p.channel}` : "")));
+  const sig = [p.rx_snr != null && `SNR ${p.rx_snr}`, p.rx_rssi != null && `RSSI ${p.rx_rssi}`,
+               p.hops != null && (p.hops === 0 ? "direct" : `${p.hops} hop${p.hops > 1 ? "s" : ""}`),
+               p.via_mqtt && "via MQTT"].filter(Boolean).join(" · ");
+  if (sig) head.append(el("span", "ml-auto tabular-nums", sig));
+  const summary = packetSummary(p);
+  const detail = el("pre", "hidden mt-2 text-xs bg-slate-50 rounded p-2 overflow-x-auto", JSON.stringify(p.data, null, 2));
+  row.append(head);
+  if (summary) row.append(el("div", "text-sm whitespace-pre-wrap break-words mt-0.5", summary));
+  row.append(detail);
+  row.addEventListener("click", (ev) => {
+    if (window.getSelection().toString()) return;  // let people select text in the JSON
+    detail.classList.toggle("hidden");
+  });
+  return row;
+}
+
+function logQuery(extra) {
+  const q = new URLSearchParams(extra);
+  if ($("log-type").value) q.set("portnum", $("log-type").value);
+  if ($("log-from").value) q.set("from_id", $("log-from").value);
+  return `/api/packets?${q}`;
+}
+
+function olderButton(show) {
+  $("log-older")?.remove();
+  if (!show) return;
+  const btn = el("button", "w-full py-2 text-sm text-emerald-700 hover:bg-slate-50", "Load older");
+  btn.id = "log-older";
+  btn.addEventListener("click", loadOlderPackets);
+  $("log-list").append(btn);
+}
+
+async function resetLog() {
+  logLoaded = true;
+  const list = $("log-list"), gen = ++logGen;
+  try {
+    const rows = await (await fetch(logQuery({ limit: LOG_PAGE }))).json();
+    if (gen !== logGen) return;
+    list.replaceChildren(...rows.map(packetRow));
+    if (!rows.length) list.append(el("p", "p-4 text-sm text-slate-500",
+      "Nothing logged yet. Every packet the radio hears will show up here."));
+    logNewest = rows.length ? rows[0].id : 0;
+    logOldest = rows.length ? rows[rows.length - 1].id : null;
+    olderButton(rows.length === LOG_PAGE);
+  } catch (e) {}
+}
+
+async function loadOlderPackets() {
+  if (logOldest == null) return;
+  const gen = logGen;
+  const rows = await (await fetch(logQuery({ limit: LOG_PAGE, before_id: logOldest }))).json();
+  if (gen !== logGen) return;
+  $("log-older")?.remove();
+  $("log-list").append(...rows.map(packetRow));
+  if (rows.length) logOldest = rows[rows.length - 1].id;
+  olderButton(rows.length === LOG_PAGE);
+}
+
+async function pollLog() {
+  if (!$("log-live").checked) return;
+  const gen = logGen;
+  try {
+    const rows = await (await fetch(logQuery({ limit: 500, since_id: logNewest }))).json();
+    if (gen !== logGen || !rows.length) return;
+    const list = $("log-list");
+    if (!logNewest) list.querySelector("p")?.remove();  // drop the "nothing logged" note
+    const before = list.scrollHeight;
+    list.prepend(...rows.map(packetRow));
+    if (list.scrollTop > 0) list.scrollTop += list.scrollHeight - before;  // keep reading position
+    logNewest = rows[0].id;
+    if (logOldest == null) logOldest = rows[rows.length - 1].id;
+  } catch (e) {}
+}
+
+async function loadLogFilters() {
+  try {
+    const types = await (await fetch("/api/packets/types")).json();
+    const sel = $("log-type"), cur = sel.value;
+    sel.replaceChildren(el("option", null, "All types"));
+    sel.firstChild.value = "";
+    types.forEach((t) => { const o = el("option", null, `${portLabel(t.portnum)} (${t.count})`); o.value = t.portnum; sel.append(o); });
+    if (cur && !types.some((t) => t.portnum === cur)) sel.append(Object.assign(el("option", null, portLabel(cur)), { value: cur }));
+    sel.value = cur;
+  } catch (e) {}
+  const sel = $("log-from"), cur = sel.value;
+  sel.replaceChildren(el("option", null, "All nodes"));
+  sel.firstChild.value = "";
+  [...knownNodes].sort((a, b) => (a.long_name || a.id).localeCompare(b.long_name || b.id))
+    .forEach((n) => { const o = el("option", null, nodeLabel(n.id, n.long_name)); o.value = n.id; sel.append(o); });
+  if (cur && ![...sel.options].some((o) => o.value === cur)) sel.append(Object.assign(el("option", null, cur), { value: cur }));
+  sel.value = cur;
+}
+
+$("log-type").addEventListener("change", resetLog);
+$("log-from").addEventListener("change", resetLog);
+$("log-live").addEventListener("change", pollLog);
+
+// --- views ------------------------------------------------------------------
+
+const VIEWS = ["chat", "map", "log"];
+const viewFromHash = () => VIEWS.includes(location.hash.slice(1)) ? location.hash.slice(1) : "chat";
+
 function showView(view) {
-  const isMap = view === "map";
-  $("chat-view").classList.toggle("hidden", isMap);
-  $("map-view").classList.toggle("hidden", !isMap);
-  $("app").classList.toggle("max-w-2xl", !isMap);
-  $("app").classList.toggle("max-w-6xl", isMap);
+  VIEWS.forEach((v) => $(`${v}-view`).classList.toggle("hidden", v !== view));
   document.querySelectorAll("nav [data-view]").forEach((a) => {
     a.classList.toggle("bg-white", a.dataset.view === view);
     a.classList.toggle("shadow", a.dataset.view === view);
   });
   clearInterval(mapTimer);
-  if (isMap) {
+  clearInterval(logTimer);
+  if (view === "map") {
     if (!map) initMap();
     map.invalidateSize();
     refreshMap();
     mapTimer = setInterval(refreshMap, 5000);
   }
+  if (view === "log") {
+    loadLogFilters();
+    logLoaded ? pollLog() : resetLog();
+    logTimer = setInterval(pollLog, 3000);
+  }
 }
 
-window.addEventListener("hashchange", () => showView(location.hash === "#map" ? "map" : "chat"));
-showView(location.hash === "#map" ? "map" : "chat");
+window.addEventListener("hashchange", () => showView(viewFromHash()));
+showView(viewFromHash());
 
 pollStatus(); pollMessages(); loadNodes();
 setInterval(pollMessages, 3000);

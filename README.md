@@ -29,6 +29,15 @@ position, coloured by how many hops away it is. It draws:
   thick on the way out and thin on the way back. Hops without a position are
   skipped and the segment over them is dotted.
 
+## Log
+
+The **Log** tab (http://localhost:8000/#log) lists every packet the radio hears,
+not just text: positions, telemetry, node info, ACKs/NAKs, traceroutes,
+neighbour reports, and packets on channels the node has no key for. Each row
+shows a readable summary and the signal (SNR, RSSI, hops); click it for the full
+packet. Filter by type or sending node. Only the newest `PACKET_LOG_MAX` packets
+are kept (default 50000; set it in `docker-compose.yml` to change it).
+
 ## API
 
 | Method | Path            | Description |
@@ -40,6 +49,8 @@ position, coloured by how many hops away it is. It draws:
 | GET    | `/api/messages/{id}/route` | Delivery info for a sent message (ACK status, hop count, last relay) and its traceroutes |
 | POST   | `/api/messages/{id}/traceroute` | Start a traceroute: `{"to": "!1d69cba4"}`. `to` defaults to the message's destination and is required for broadcasts |
 | POST   | `/api/nodes/{id}/traceroute` | Start a traceroute to a node, not tied to a message (used by the map) |
+| GET    | `/api/packets`  | Every packet heard over the radio, newest first. `?since_id=N` for newer, `?before_id=N` to page back, `?portnum=TELEMETRY_APP`, `?from_id=!1d69cba4`, `?limit=` (default 100, max 500) |
+| GET    | `/api/packets/types` | Packet types in the log with counts |
 | GET    | `/api/map`      | Nodes with positions and hop distance, radio links, and the latest traceroute to each traced node |
 
 Interactive docs: http://localhost:8000/docs
